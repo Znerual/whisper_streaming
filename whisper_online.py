@@ -4,7 +4,7 @@ import numpy as np
 import librosa  
 from functools import lru_cache
 import time
-
+import Levenshtein
 
 
 @lru_cache
@@ -26,11 +26,11 @@ class ASRBase:
     # join transcribe words with this character (" " for whisper_timestamped, "" for faster-whisper because it emits the spaces when neeeded)
     sep = " "
 
-    def __init__(self, lan, modelsize=None, cache_dir=None, model_dir=None):
+    def __init__(self, lan, modelsize=None, cache_dir=None, model_dir=None, **kwargs):
         self.transcribe_kargs = {}
         self.original_language = lan 
 
-        self.model = self.load_model(modelsize, cache_dir, model_dir)
+        self.model = self.load_model(modelsize, cache_dir, model_dir, **kwargs)
 
     def load_model(self, modelsize, cache_dir):
         raise NotImplemented("must be implemented in the child class")
@@ -89,7 +89,7 @@ class FasterWhisperASR(ASRBase):
 
     sep = ""
 
-    def load_model(self, modelsize=None, cache_dir=None, model_dir=None):
+    def load_model(self, modelsize=None, cache_dir=None, model_dir=None, gpu=True):
         from faster_whisper import WhisperModel
 
 
@@ -103,8 +103,10 @@ class FasterWhisperASR(ASRBase):
 
 
         # this worked fast and reliably on NVIDIA L40
-        model = WhisperModel(model_size_or_path, device="cuda", compute_type="float16", download_root=cache_dir)
-
+        if gpu:
+            model = WhisperModel(model_size_or_path, device="cuda", compute_type="float16", download_root=cache_dir)
+        else:
+            model = WhisperModel(model_size_or_path, device="cpu", compute_type="float32", download_root=cache_dir)
         # or run on GPU with INT8
         # tested: the transcripts were different, probably worse than with FP16, and it was slightly (appx 20%) slower
         #model = WhisperModel(model_size, device="cuda", compute_type="int8_float16")
@@ -125,7 +127,7 @@ class FasterWhisperASR(ASRBase):
             for word in segment.words:
                 # not stripping the spaces -- should not be merged with them!
                 w = word.word
-                t = (word.start, word.end, w)
+                t = (word.start, word.end, w, word.probability)
                 o.append(t)
         return o
 
@@ -154,11 +156,14 @@ class HypothesisBuffer:
         # compare self.commited_in_buffer and new. It inserts only the words in new that extend the commited_in_buffer, it means they are roughly behind last_commited_time and new in content
         # the new tail is added to self.new
         
-        new = [(a+offset,b+offset,t) for a,b,t in new]
-        self.new = [(a,b,t) for a,b,t in new if a > self.last_commited_time-0.1]
+        new = [(a+offset,b+offset,t,p) for a,b,t,p in new]
+        self.new = [(a,b,t,p) for a,b,t,p in new if a > self.last_commited_time-0.1]
+
+        #print("new:",new)
+        #print("self.new:",self.new)
 
         if len(self.new) >= 1:
-            a,b,t = self.new[0]
+            a,b,t,p = self.new[0]
             if abs(a - self.last_commited_time) < 1:
                 if self.commited_in_buffer:
                     # it's going to search for 1, 2, ..., 5 consecutive words (n-grams) that are identical in commited and new. If they are, they're dropped.
@@ -167,34 +172,42 @@ class HypothesisBuffer:
                     for i in range(1,min(min(cn,nn),5)+1):  # 5 is the maximum 
                         c = " ".join([self.commited_in_buffer[-j][2] for j in range(1,i+1)][::-1])
                         tail = " ".join(self.new[j-1][2] for j in range(1,i+1))
-                        if c == tail:
+                        if Levenshtein.distance(c.lower(), tail.lower()) < 2:
                             print("removing last",i,"words:",file=sys.stderr)
                             for j in range(i):
                                 print("\t",self.new.pop(0),file=sys.stderr)
                             break
+                        
+        #self.buffer.extend(self.new)
+        self.commited_in_buffer.extend(self.new)
+        return self.new
+            
+        
 
-    def flush(self):
-        # returns commited chunk = the longest common prefix of 2 last inserts. 
+    # def flush(self):
+    #     # returns commited chunk = the longest common prefix of 2 last inserts. 
 
-        commit = []
-        while self.new:
-            na, nb, nt = self.new[0]
+    #     commit = []
+    #     while self.new:
+    #         na, nb, nt, np = self.new[0]
 
-            if len(self.buffer) == 0:
-                break
+    #         if len(self.buffer) == 0:
+    #             print("buffer is empty",file=sys.stderr)
+    #             break
 
-            if nt == self.buffer[0][2]:
-                commit.append((na,nb,nt))
-                self.last_commited_word = nt
-                self.last_commited_time = nb
-                self.buffer.pop(0)
-                self.new.pop(0)
-            else:
-                break
-        self.buffer = self.new
-        self.new = []
-        self.commited_in_buffer.extend(commit)
-        return commit
+            
+    #         if Levenshtein.distance(nt.lower(), self.buffer[0][2].lower()) < 2:
+    #             commit.append((na,nb,nt,np))
+    #             self.last_commited_word = nt
+    #             self.last_commited_time = nb
+    #             self.buffer.pop(0)
+    #             self.new.pop(0)
+    #         else:
+    #             break
+    #     self.buffer = self.new
+    #     self.new = []
+    #     self.commited_in_buffer.extend(commit)
+    #     return commit
 
     def pop_commited(self, time):
         while self.commited_in_buffer and self.commited_in_buffer[0][1] <= time:
@@ -239,7 +252,7 @@ class OnlineASRProcessor:
             k -= 1
 
         p = self.commited[:k]
-        p = [t for _,_,t in p]
+        p = [t for _,_,t,_ in p]
         prompt = []
         l = 0
         while p and l < 200:  # 200 characters prompt size
@@ -247,7 +260,7 @@ class OnlineASRProcessor:
             l += len(x)+1
             prompt.append(x)
         non_prompt = self.commited[k:]
-        return self.asr.sep.join(prompt[::-1]), self.asr.sep.join(t for _,_,t in non_prompt)
+        return self.asr.sep.join(prompt[::-1]), self.asr.sep.join(t for _,_,t,_ in non_prompt)
 
     def process_iter(self):
         """Runs on the current audio buffer.
@@ -255,103 +268,124 @@ class OnlineASRProcessor:
         The non-emty text is confirmed (commited) partial transcript.
         """
 
-        prompt, non_prompt = self.prompt()
-        print("PROMPT:", prompt, file=sys.stderr)
-        print("CONTEXT:", non_prompt, file=sys.stderr)
-        print(f"transcribing {len(self.audio_buffer)/self.SAMPLING_RATE:2.2f} seconds from {self.buffer_time_offset:2.2f}",file=sys.stderr)
-        res = self.asr.transcribe(self.audio_buffer, init_prompt=prompt)
+        
+        while self.buffer_time_offset < len(self.audio_buffer) // self.SAMPLING_RATE - 0.2:
+            prompt, non_prompt = self.prompt()
+            #print("PROMPT:", prompt, file=sys.stderr)
+            #print("CONTEXT:", non_prompt, file=sys.stderr)
+            
+            index_start = int(self.buffer_time_offset * self.SAMPLING_RATE)
+            index_end = len(self.audio_buffer)
+            if len(self.audio_buffer[index_start:index_end])/self.SAMPLING_RATE > 30:
+                index_end = index_start + int(30*self.SAMPLING_RATE)
+            
+            #print(f"transcribing {len(self.audio_buffer[index_start:index_end])/self.SAMPLING_RATE:2.2f} seconds from {self.buffer_time_offset + self.last_chunked_at:2.2f}",file=sys.stderr)
+            res = self.asr.transcribe(self.audio_buffer[index_start:index_end], init_prompt=prompt)
+            #print("res: ", res)
+            # transform to [(beg,end,"word1"), ...]
+            tsw = self.asr.ts_words(res)
 
-        # transform to [(beg,end,"word1"), ...]
-        tsw = self.asr.ts_words(res)
+            #print("tws:",tsw)
+            o = self.transcript_buffer.insert(tsw, self.buffer_time_offset + self.last_chunked_at)
+            #o = self.transcript_buffer.flush()
+            self.commited.extend(o)
+            #print(">>>>COMPLETE NOW:",self.to_flush(o),file=sys.stderr,flush=True)
+            #print("INCOMPLETE:",self.to_flush(self.transcript_buffer.complete()),file=sys.stderr,flush=True)
 
-        self.transcript_buffer.insert(tsw, self.buffer_time_offset)
-        o = self.transcript_buffer.flush()
-        self.commited.extend(o)
-        print(">>>>COMPLETE NOW:",self.to_flush(o),file=sys.stderr,flush=True)
-        print("INCOMPLETE:",self.to_flush(self.transcript_buffer.complete()),file=sys.stderr,flush=True)
+            self.buffer_time_offset += min((index_end - index_start) / self.SAMPLING_RATE, 25) # 5 seconds overlap
+            # there is a newly confirmed text
+            if o:
+                
+                #print("Chunking")
+                # we trim all the completed sentences from the audio buffer
+                #self.chunk_completed_sentence()
 
-        # there is a newly confirmed text
-        if o:
-            # we trim all the completed sentences from the audio buffer
-            self.chunk_completed_sentence()
+                # ...segments could be considered
+                self.chunk_completed_segment(res)
+                
+                # 
+    #            self.silence_iters = 0
 
-            # ...segments could be considered
-            #self.chunk_completed_segment(res)
+            # this was an attempt to trim silence/non-linguistic noise detected by the fact that Whisper doesn't transcribe anything for 3-times in a row.
+            # It seemed not working better, or needs to be debugged.
 
-            # 
-#            self.silence_iters = 0
-
-         # this was an attempt to trim silence/non-linguistic noise detected by the fact that Whisper doesn't transcribe anything for 3-times in a row.
-         # It seemed not working better, or needs to be debugged.
-
-#        elif self.transcript_buffer.complete():
-#            self.silence_iters = 0
-#        elif not self.transcript_buffer.complete():
-#        #    print("NOT COMPLETE:",to_flush(self.transcript_buffer.complete()),file=sys.stderr,flush=True)
-#            self.silence_iters += 1
-#            if self.silence_iters >= 3:
-#                n = self.last_chunked_at
-##                self.chunk_completed_sentence()
-##                if n == self.last_chunked_at:
-#                self.chunk_at(self.last_chunked_at+self.chunk)
-#                print(f"\tCHUNK: 3-times silence! chunk_at {n}+{self.chunk}",file=sys.stderr)
-##                self.silence_iters = 0
+    #        elif self.transcript_buffer.complete():
+    #            self.silence_iters = 0
+    #        elif not self.transcript_buffer.complete():
+    #        #    print("NOT COMPLETE:",to_flush(self.transcript_buffer.complete()),file=sys.stderr,flush=True)
+    #            self.silence_iters += 1
+    #            if self.silence_iters >= 3:
+    #                n = self.last_chunked_at
+    ##                self.chunk_completed_sentence()
+    ##                if n == self.last_chunked_at:
+    #                self.chunk_at(self.last_chunked_at+self.chunk)
+    #                print(f"\tCHUNK: 3-times silence! chunk_at {n}+{self.chunk}",file=sys.stderr)
+    ##                self.silence_iters = 0
 
 
-        # if the audio buffer is longer than 30s, trim it...
-        if len(self.audio_buffer)/self.SAMPLING_RATE > 30:
-            # ...on the last completed segment (labeled by Whisper)
-            self.chunk_completed_segment(res)
+            # if the audio buffer is longer than 30s, trim it...
+            #if len(self.audio_buffer)/self.SAMPLING_RATE > 30:
+                # ...on the last completed segment (labeled by Whisper)
+                #self.chunk_completed_segment(res)
 
-            # alternative: on any word
-            #l = self.buffer_time_offset + len(self.audio_buffer)/self.SAMPLING_RATE - 10
-            # let's find commited word that is less
-            #k = len(self.commited)-1
-            #while k>0 and self.commited[k][1] > l:
-            #    k -= 1
-            #t = self.commited[k][1] 
-            print(f"chunking because of len",file=sys.stderr)
-            #self.chunk_at(t)
+                # alternative: on any word
+                #l = self.buffer_time_offset + len(self.audio_buffer)/self.SAMPLING_RATE - 10
+                # let's find commited word that is less
+                #k = len(self.commited)-1
+                #while k>0 and self.commited[k][1] > l:
+                #    k -= 1
+                #t = self.commited[k][1] 
+                #print(f"chunking because of len",file=sys.stderr)
+                #self.chunk_at(t)
 
-        print(f"len of buffer now: {len(self.audio_buffer)/self.SAMPLING_RATE:2.2f}",file=sys.stderr)
-        return self.to_flush(o)
+            #print(f"len of buffer now: {len(self.audio_buffer)/self.SAMPLING_RATE:2.2f}",file=sys.stderr)
+            yield self.to_flush(o)
 
     def chunk_completed_sentence(self):
-        if self.commited == []: return
+        if self.commited == []: 
+            print("Nothing comminted")
+            return
         print(self.commited,file=sys.stderr)
         sents = self.words_to_sentences(self.commited)
         for s in sents:
             print("\t\tSENT:",s,file=sys.stderr)
         if len(sents) < 2:
+            print("Not enough sentences")
             return
         while len(sents) > 2:
             sents.pop(0)
         # we will continue with audio processing at this timestamp
         chunk_at = sents[-2][1]
 
-        print(f"--- sentence chunked at {chunk_at:2.2f}",file=sys.stderr)
+        #print(f"--- sentence chunked at {chunk_at:2.2f}",file=sys.stderr)
         self.chunk_at(chunk_at)
 
     def chunk_completed_segment(self, res):
-        if self.commited == []: return
+        if self.commited == []: 
+            #print("Nothing comminted")
+            return
 
         ends = self.asr.segments_end_ts(res)
 
-        t = self.commited[-1][1]
+        t = self.buffer_time_offset + self.last_chunked_at #self.commited[-1][1]
+        
+        while len(ends) > 1:
 
-        if len(ends) > 1:
-
-            e = ends[-2]+self.buffer_time_offset
-            while len(ends) > 2 and e > t:
-                ends.pop(-1)
-                e = ends[-2]+self.buffer_time_offset
+            
+            e = ends[-1]+self.last_chunked_at
+                
             if e <= t:
-                print(f"--- segment chunked at {e:2.2f}",file=sys.stderr)
+                #print(f"--- segment chunked at {e:2.2f}",file=sys.stderr)
                 self.chunk_at(e)
-            else:
-                print(f"--- last segment not within commited area",file=sys.stderr)
-        else:
-            print(f"--- not enough segments to chunk",file=sys.stderr)
+                return
+            
+            # too far, let's try the previous segment
+            ends.pop(-1)
+            # else:
+            #     print(f"--- last segment not within commited area",file=sys.stderr)
+                
+        
+        #print(f"--- not enough segments to chunk",file=sys.stderr)
 
 
 
@@ -360,11 +394,15 @@ class OnlineASRProcessor:
     def chunk_at(self, time):
         """trims the hypothesis and audio buffer at "time"
         """
-        self.transcript_buffer.pop_commited(time)
-        cut_seconds = time - self.buffer_time_offset
+        #self.transcript_buffer.pop_commited(time)
+        print(f"Chunking at time: {time}, with a last chunked at {self.last_chunked_at} and a buffer time offset of {self.buffer_time_offset}",file=sys.stderr)
+        cut_seconds = time - self.last_chunked_at
         self.audio_buffer = self.audio_buffer[int(cut_seconds)*self.SAMPLING_RATE:]
-        self.buffer_time_offset = time
+        self.buffer_time_offset -= cut_seconds
         self.last_chunked_at = time
+        # print("cut at ",time,file=sys.stderr)
+        # print("Removed ",cut_seconds," seconds from audio buffer",file=sys.stderr)
+        # print("Chnked, buffer time offset: ",self.buffer_time_offset,file=sys.stderr)
 
     def words_to_sentences(self, words):
         """Uses self.tokenizer for sentence segmentation of words.
@@ -373,7 +411,13 @@ class OnlineASRProcessor:
         
         cwords = [w for w in words]
         t = " ".join(o[2] for o in cwords)
-        s = self.tokenizer.split(t)
+        if hasattr(self.tokenizer, "split"):
+            s = self.tokenizer.split(t)
+        elif hasattr(self.tokenizer, "tokenize"):
+            s = self.tokenizer.tokenize(t)
+        else:
+            raise ValueError("tokenizer must have split or tokenize method")
+        
         out = []
         while s:
             beg = None
@@ -381,7 +425,7 @@ class OnlineASRProcessor:
             sent = s.pop(0).strip()
             fsent = sent
             while cwords:
-                b,e,w = cwords.pop(0)
+                b,e,w,p = cwords.pop(0)
                 if beg is None and sent.startswith(w):
                     beg = b
                 elif end is None and sent == w:
@@ -432,7 +476,7 @@ def create_tokenizer(lan):
 
     # supported by fast-mosestokenizer
     if lan in "as bn ca cs de el en es et fi fr ga gu hi hu is it kn lt lv ml mni mr nl or pa pl pt ro ru sk sl sv ta te yue zh".split():
-        from mosestokenizer import MosesTokenizer
+        from sacremoses import MosesTokenizer
         return MosesTokenizer(lan)
 
     # the following languages are in Whisper, but not in wtpsplit:
