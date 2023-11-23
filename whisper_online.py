@@ -303,43 +303,10 @@ class OnlineASRProcessor:
                 # ...segments could be considered
                 self.chunk_completed_segment(res)
                 
-                # 
-    #            self.silence_iters = 0
 
-            # this was an attempt to trim silence/non-linguistic noise detected by the fact that Whisper doesn't transcribe anything for 3-times in a row.
-            # It seemed not working better, or needs to be debugged.
-
-    #        elif self.transcript_buffer.complete():
-    #            self.silence_iters = 0
-    #        elif not self.transcript_buffer.complete():
-    #        #    print("NOT COMPLETE:",to_flush(self.transcript_buffer.complete()),file=sys.stderr,flush=True)
-    #            self.silence_iters += 1
-    #            if self.silence_iters >= 3:
-    #                n = self.last_chunked_at
-    ##                self.chunk_completed_sentence()
-    ##                if n == self.last_chunked_at:
-    #                self.chunk_at(self.last_chunked_at+self.chunk)
-    #                print(f"\tCHUNK: 3-times silence! chunk_at {n}+{self.chunk}",file=sys.stderr)
-    ##                self.silence_iters = 0
-
-
-            # if the audio buffer is longer than 30s, trim it...
-            #if len(self.audio_buffer)/self.SAMPLING_RATE > 30:
-                # ...on the last completed segment (labeled by Whisper)
-                #self.chunk_completed_segment(res)
-
-                # alternative: on any word
-                #l = self.buffer_time_offset + len(self.audio_buffer)/self.SAMPLING_RATE - 10
-                # let's find commited word that is less
-                #k = len(self.commited)-1
-                #while k>0 and self.commited[k][1] > l:
-                #    k -= 1
-                #t = self.commited[k][1] 
-                #print(f"chunking because of len",file=sys.stderr)
-                #self.chunk_at(t)
-
-            #print(f"len of buffer now: {len(self.audio_buffer)/self.SAMPLING_RATE:2.2f}",file=sys.stderr)
-            yield self.to_flush(o)
+            for start, end, text, probability in o:
+                yield (start, end, probability, text)
+            #yield self.to_flush(o)
 
     def chunk_completed_sentence(self):
         if self.commited == []: 
