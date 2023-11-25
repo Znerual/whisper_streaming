@@ -119,17 +119,16 @@ class FasterWhisperASR(ASRBase):
     def transcribe(self, audio, init_prompt=""):
         # tested: beam_size=5 is faster and better than 1 (on one 200 second document from En ESIC, min chunk 0.01)
         segments, info = self.model.transcribe(audio, language=self.original_language, initial_prompt=init_prompt, beam_size=5, word_timestamps=True, condition_on_previous_text=True, **self.transcribe_kargs)
-        return list(segments)
+        return segments
 
-    def ts_words(self, segments):
-        o = []
-        for segment in segments:
-            for word in segment.words:
-                # not stripping the spaces -- should not be merged with them!
-                w = word.word
-                t = (word.start, word.end, w, word.probability)
-                o.append(t)
-        return o
+    def ts_words(self, segment):
+        #for segment in segments:
+        for word in segment.words:
+            # not stripping the spaces -- should not be merged with them!
+            w = word.word
+            t = (word.start, word.end, w, word.probability)
+            yield t
+
 
     def segments_end_ts(self, res):
         return [s.end for s in res]
@@ -151,6 +150,24 @@ class HypothesisBuffer:
 
         self.last_commited_time = 0
         self.last_commited_word = None
+
+    def insert_single(self, new, offset):
+        a,b,t,p = new
+        if len(self.commited_in_buffer) == 0 or a + offset > self.commited_in_buffer[-1][1]-0.1:
+            self.commited_in_buffer.append((a+offset,b+offset,t,p))
+            self.last_commited_time = b+offset
+            self.last_commited_word = t
+            return (a+offset,b+offset,t,p)
+        
+        if a + offset < self.commited_in_buffer[-1][1] and a + offset > self.commited_in_buffer[-1][0]-0.1:
+            if p > self.commited_in_buffer[-1][3]:
+                print("Replaced last word in buffer:",self.commited_in_buffer[-1],"with",new,file=sys.stderr)
+                self.commited_in_buffer[-1] = (a+offset,b+offset,t,p)
+                self.last_commited_time = b+offset
+                self.last_commited_word = t
+                return (a+offset,b+offset,t,p)
+            
+        return None
 
     def insert(self, new, offset):
         # compare self.commited_in_buffer and new. It inserts only the words in new that extend the commited_in_buffer, it means they are roughly behind last_commited_time and new in content
@@ -180,39 +197,10 @@ class HypothesisBuffer:
                         
         #self.buffer.extend(self.new)
         self.commited_in_buffer.extend(self.new)
+        self.last_commited_time = self.new[-1][1]
         return self.new
             
         
-
-    # def flush(self):
-    #     # returns commited chunk = the longest common prefix of 2 last inserts. 
-
-    #     commit = []
-    #     while self.new:
-    #         na, nb, nt, np = self.new[0]
-
-    #         if len(self.buffer) == 0:
-    #             print("buffer is empty",file=sys.stderr)
-    #             break
-
-            
-    #         if Levenshtein.distance(nt.lower(), self.buffer[0][2].lower()) < 2:
-    #             commit.append((na,nb,nt,np))
-    #             self.last_commited_word = nt
-    #             self.last_commited_time = nb
-    #             self.buffer.pop(0)
-    #             self.new.pop(0)
-    #         else:
-    #             break
-    #     self.buffer = self.new
-    #     self.new = []
-    #     self.commited_in_buffer.extend(commit)
-    #     return commit
-
-    def pop_commited(self, time):
-        while self.commited_in_buffer and self.commited_in_buffer[0][1] <= time:
-            self.commited_in_buffer.pop(0)
-
     def complete(self):
         return self.buffer
 
@@ -220,13 +208,13 @@ class OnlineASRProcessor:
 
     SAMPLING_RATE = 16000
 
-    def __init__(self, asr, tokenizer):
+    def __init__(self, asr, tokenizer, language):
         """asr: WhisperASR object
         tokenizer: sentence tokenizer object for the target language. Must have a method *split* that behaves like the one of MosesTokenizer.
         """
         self.asr = asr
         self.tokenizer = tokenizer
-
+        self.language = language
         self.init()
 
     def init(self):
@@ -248,9 +236,12 @@ class OnlineASRProcessor:
         "context" is the commited text that is inside the audio buffer. It is transcribed again and skipped. It is returned only for debugging and logging reasons.
         """
         k = max(0,len(self.commited)-1)
-        while k > 0 and self.commited[k-1][1] > self.last_chunked_at:
-            k -= 1
 
+        if k == 0:
+            return "", ""
+        
+        #print(self.commited,file=sys.stderr)
+        #print(self.commited[:k], file=sys.stderr)
         p = self.commited[:k]
         p = [t for _,_,t,_ in p]
         prompt = []
@@ -280,32 +271,27 @@ class OnlineASRProcessor:
                 index_end = index_start + int(30*self.SAMPLING_RATE)
             
             #print(f"transcribing {len(self.audio_buffer[index_start:index_end])/self.SAMPLING_RATE:2.2f} seconds from {self.buffer_time_offset + self.last_chunked_at:2.2f}",file=sys.stderr)
-            res = self.asr.transcribe(self.audio_buffer[index_start:index_end], init_prompt=prompt)
+            print(f"Index start: {index_start}, index end: {index_end}",file=sys.stderr)
+            segments = self.asr.transcribe(self.audio_buffer[index_start:index_end], init_prompt=prompt)
             #print("res: ", res)
             # transform to [(beg,end,"word1"), ...]
-            tsw = self.asr.ts_words(res)
+            for segment in segments:
+                for t in self.asr.ts_words(segment):
+                    print(t)
+                    o = self.transcript_buffer.insert_single(t, self.buffer_time_offset)
+                    if not o is None:
+                        self.commited.append(o)
+                        yield o
 
-            #print("tws:",tsw)
-            o = self.transcript_buffer.insert(tsw, self.buffer_time_offset + self.last_chunked_at)
-            #o = self.transcript_buffer.flush()
-            self.commited.extend(o)
+      
+            
             #print(">>>>COMPLETE NOW:",self.to_flush(o),file=sys.stderr,flush=True)
             #print("INCOMPLETE:",self.to_flush(self.transcript_buffer.complete()),file=sys.stderr,flush=True)
 
-            self.buffer_time_offset += min((index_end - index_start) / self.SAMPLING_RATE, 25) # 5 seconds overlap
+            self.buffer_time_offset += min(int((index_end - index_start) / self.SAMPLING_RATE), 28) # 2 seconds overlap
+            print("buffer time offset:",self.buffer_time_offset,file=sys.stderr,flush=True)
             # there is a newly confirmed text
-            if o:
-                
-                #print("Chunking")
-                # we trim all the completed sentences from the audio buffer
-                #self.chunk_completed_sentence()
-
-                # ...segments could be considered
-                self.chunk_completed_segment(res)
-                
-
-            for start, end, text, probability in o:
-                yield (start, end, probability, text)
+            
             #yield self.to_flush(o)
 
     def chunk_completed_sentence(self):
@@ -459,156 +445,3 @@ def create_tokenizer(lan):
             return wtp.split(sent, lang_code=lan)
     return WtPtok()
 
-
-
-
-## main:
-
-if __name__ == "__main__":
-
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('audio_path', type=str, help="Filename of 16kHz mono channel wav, on which live streaming is simulated.")
-    parser.add_argument('--min-chunk-size', type=float, default=1.0, help='Minimum audio chunk size in seconds. It waits up to this time to do processing. If the processing takes shorter time, it waits, otherwise it processes the whole segment that was received by this time.')
-    parser.add_argument('--model', type=str, default='large-v2', choices="tiny.en,tiny,base.en,base,small.en,small,medium.en,medium,large-v1,large-v2,large".split(","),help="Name size of the Whisper model to use (default: large-v2). The model is automatically downloaded from the model hub if not present in model cache dir.")
-    parser.add_argument('--model_cache_dir', type=str, default=None, help="Overriding the default model cache dir where models downloaded from the hub are saved")
-    parser.add_argument('--model_dir', type=str, default=None, help="Dir where Whisper model.bin and other files are saved. This option overrides --model and --model_cache_dir parameter.")
-    parser.add_argument('--lan', '--language', type=str, default='en', help="Language code for transcription, e.g. en,de,cs.")
-    parser.add_argument('--task', type=str, default='transcribe', choices=["transcribe","translate"],help="Transcribe or translate.")
-    parser.add_argument('--start_at', type=float, default=0.0, help='Start processing audio at this time.')
-    parser.add_argument('--backend', type=str, default="faster-whisper", choices=["faster-whisper", "whisper_timestamped"],help='Load only this backend for Whisper processing.')
-    parser.add_argument('--offline', action="store_true", default=False, help='Offline mode.')
-    parser.add_argument('--comp_unaware', action="store_true", default=False, help='Computationally unaware simulation.')
-    parser.add_argument('--vad', action="store_true", default=False, help='Use VAD = voice activity detection, with the default parameters.')
-    args = parser.parse_args()
-
-    if args.offline and args.comp_unaware:
-        print("No or one option from --offline and --comp_unaware are available, not both. Exiting.",file=sys.stderr)
-        sys.exit(1)
-
-    audio_path = args.audio_path
-
-    SAMPLING_RATE = 16000
-    duration = len(load_audio(audio_path))/SAMPLING_RATE
-    print("Audio duration is: %2.2f seconds" % duration, file=sys.stderr)
-
-    size = args.model
-    language = args.lan
-
-    t = time.time()
-    print(f"Loading Whisper {size} model for {language}...",file=sys.stderr,end=" ",flush=True)
-    #asr = WhisperASR(lan=language, modelsize=size)
-
-    if args.backend == "faster-whisper":
-        from faster_whisper import WhisperModel
-        asr_cls = FasterWhisperASR
-    else:
-        import whisper
-        import whisper_timestamped
-    #    from whisper_timestamped_model import WhisperTimestampedASR
-        asr_cls = WhisperTimestampedASR
-
-    asr = asr_cls(modelsize=size, lan=language, cache_dir=args.model_cache_dir, model_dir=args.model_dir)
-
-    if args.task == "translate":
-        asr.set_translate_task()
-        tgt_language = "en"  # Whisper translates into English
-    else:
-        tgt_language = language  # Whisper transcribes in this language
-
-
-    e = time.time()
-    print(f"done. It took {round(e-t,2)} seconds.",file=sys.stderr)
-
-    if args.vad:
-        print("setting VAD filter",file=sys.stderr)
-        asr.use_vad()
-
-    
-    min_chunk = args.min_chunk_size
-    online = OnlineASRProcessor(asr,create_tokenizer(tgt_language))
-
-
-    # load the audio into the LRU cache before we start the timer
-    a = load_audio_chunk(audio_path,0,1)
-
-    # warm up the ASR, because the very first transcribe takes much more time than the other
-    asr.transcribe(a)
-
-    beg = args.start_at
-    start = time.time()-beg
-
-    def output_transcript(o, now=None):
-        # output format in stdout is like:
-        # 4186.3606 0 1720 Takhle to je
-        # - the first three words are:
-        #    - emission time from beginning of processing, in milliseconds
-        #    - beg and end timestamp of the text segment, as estimated by Whisper model. The timestamps are not accurate, but they're useful anyway
-        # - the next words: segment transcript
-        if now is None:
-            now = time.time()-start
-        if o[0] is not None:
-            print("%1.4f %1.0f %1.0f %s" % (now*1000, o[0]*1000,o[1]*1000,o[2]),file=sys.stderr,flush=True)
-            print("%1.4f %1.0f %1.0f %s" % (now*1000, o[0]*1000,o[1]*1000,o[2]),flush=True)
-        else:
-            print(o,file=sys.stderr,flush=True)
-
-    if args.offline: ## offline mode processing (for testing/debugging)
-        a = load_audio(audio_path)
-        online.insert_audio_chunk(a)
-        try:
-            o = online.process_iter()
-        except AssertionError:
-            print("assertion error",file=sys.stderr)
-            pass
-        else:
-            output_transcript(o)
-        now = None
-    elif args.comp_unaware:  # computational unaware mode 
-        end = beg + min_chunk
-        while True:
-            a = load_audio_chunk(audio_path,beg,end)
-            online.insert_audio_chunk(a)
-            try:
-                o = online.process_iter()
-            except AssertionError:
-                print("assertion error",file=sys.stderr)
-                pass
-            else:
-                output_transcript(o, now=end)
-
-            print(f"## last processed {end:.2f}s",file=sys.stderr,flush=True)
-
-            beg = end
-            end += min_chunk
-            if end >= duration:
-                break
-        now = duration
-
-    else: # online = simultaneous mode
-        end = 0
-        while True:
-            now = time.time() - start
-            if now < end+min_chunk:
-                time.sleep(min_chunk+end-now)
-            end = time.time() - start
-            a = load_audio_chunk(audio_path,beg,end)
-            beg = end
-            online.insert_audio_chunk(a)
-
-            try:
-                o = online.process_iter()
-            except AssertionError:
-                print("assertion error",file=sys.stderr)
-                pass
-            else:
-                output_transcript(o)
-            now = time.time() - start
-            print(f"## last processed {end:.2f} s, now is {now:.2f}, the latency is {now-end:.2f}",file=sys.stderr,flush=True)
-
-            if end >= duration:
-                break
-        now = None
-
-    o = online.finish()
-    output_transcript(o, now=now)
