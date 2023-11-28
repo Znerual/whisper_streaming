@@ -277,7 +277,7 @@ class OnlineASRProcessor:
             # transform to [(beg,end,"word1"), ...]
             for segment in segments:
                 for t in self.asr.ts_words(segment):
-                    print(t)
+                    #print(t)
                     o = self.transcript_buffer.insert_single(t, self.buffer_time_offset)
                     if not o is None:
                         self.commited.append(o)
