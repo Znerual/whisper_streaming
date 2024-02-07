@@ -46,38 +46,38 @@ class ASRBase:
 #      import whisper
 #      import whisper_timestamped
 
-class WhisperTimestampedASR(ASRBase):
-    """Uses whisper_timestamped library as the backend. Initially, we tested the code on this backend. It worked, but slower than faster-whisper.
-    On the other hand, the installation for GPU could be easier.
+# class WhisperTimestampedASR(ASRBase):
+#     """Uses whisper_timestamped library as the backend. Initially, we tested the code on this backend. It worked, but slower than faster-whisper.
+#     On the other hand, the installation for GPU could be easier.
 
-    If used, requires imports:
-        import whisper
-        import whisper_timestamped
-    """
+#     If used, requires imports:
+#         import whisper
+#         import whisper_timestamped
+#     """
 
-    def load_model(self, modelsize=None, cache_dir=None, model_dir=None):
-        if model_dir is not None:
-            print("ignoring model_dir, not implemented",file=sys.stderr)
-        return whisper.load_model(modelsize, download_root=cache_dir)
+#     def load_model(self, modelsize=None, cache_dir=None, model_dir=None):
+#         if model_dir is not None:
+#             print("ignoring model_dir, not implemented",file=sys.stderr)
+#         return whisper.load_model(modelsize, download_root=cache_dir)
 
-    def transcribe(self, audio, init_prompt=""):
-        result = whisper_timestamped.transcribe_timestamped(self.model, audio, language=self.original_language, initial_prompt=init_prompt, verbose=None, condition_on_previous_text=True)
-        return result
+#     def transcribe(self, audio, init_prompt=""):
+#         result = whisper_timestamped.transcribe_timestamped(self.model, audio, language=self.original_language, initial_prompt=init_prompt, verbose=None, condition_on_previous_text=True)
+#         return result
  
-    def ts_words(self,r):
-        # return: transcribe result object to [(beg,end,"word1"), ...]
-        o = []
-        for s in r["segments"]:
-            for w in s["words"]:
-                t = (w["start"],w["end"],w["text"])
-                o.append(t)
-        return o
+#     def ts_words(self,r):
+#         # return: transcribe result object to [(beg,end,"word1"), ...]
+#         o = []
+#         for s in r["segments"]:
+#             for w in s["words"]:
+#                 t = (w["start"],w["end"],w["text"])
+#                 o.append(t)
+#         return o
 
-    def segments_end_ts(self, res):
-        return [s["end"] for s in res["segments"]]
+#     def segments_end_ts(self, res):
+#         return [s["end"] for s in res["segments"]]
 
-    def use_vad(self):
-        raise NotImplemented("Feature use_vad is not implemented for whisper_timestamped backend.")
+#     def use_vad(self):
+#         raise NotImplemented("Feature use_vad is not implemented for whisper_timestamped backend.")
 
 
 class FasterWhisperASR(ASRBase):
@@ -119,7 +119,7 @@ class FasterWhisperASR(ASRBase):
     def transcribe(self, audio, init_prompt=""):
         # tested: beam_size=5 is faster and better than 1 (on one 200 second document from En ESIC, min chunk 0.01)
         segments, info = self.model.transcribe(audio, language=self.original_language, initial_prompt=init_prompt, beam_size=5, word_timestamps=True, condition_on_previous_text=True, **self.transcribe_kargs)
-        return segments
+        return segments, info
 
     def ts_words(self, segment):
         #for segment in segments:
@@ -208,13 +208,13 @@ class OnlineASRProcessor:
 
     SAMPLING_RATE = 16000
 
-    def __init__(self, asr, tokenizer, language):
+    def __init__(self, asr): #tokenizer, language
         """asr: WhisperASR object
         tokenizer: sentence tokenizer object for the target language. Must have a method *split* that behaves like the one of MosesTokenizer.
         """
         self.asr = asr
-        self.tokenizer = tokenizer
-        self.language = language
+        # self.tokenizer = tokenizer
+        self.language = None # language
         self.init()
 
     def init(self):
@@ -271,8 +271,9 @@ class OnlineASRProcessor:
                 index_end = index_start + int(30*self.SAMPLING_RATE)
             
             #print(f"transcribing {len(self.audio_buffer[index_start:index_end])/self.SAMPLING_RATE:2.2f} seconds from {self.buffer_time_offset + self.last_chunked_at:2.2f}",file=sys.stderr)
-            print(f"Index start: {index_start}, index end: {index_end}",file=sys.stderr)
-            segments = self.asr.transcribe(self.audio_buffer[index_start:index_end], init_prompt=prompt)
+            #print(f"Index start: {index_start}, index end: {index_end}",file=sys.stderr)
+            segments, info = self.asr.transcribe(self.audio_buffer[index_start:index_end], init_prompt=prompt)
+            
             #print("res: ", res)
             # transform to [(beg,end,"word1"), ...]
             for segment in segments:
@@ -281,7 +282,7 @@ class OnlineASRProcessor:
                     o = self.transcript_buffer.insert_single(t, self.buffer_time_offset)
                     if not o is None:
                         self.commited.append(o)
-                        yield o
+                        yield (*o, info.language)
 
       
             
@@ -289,17 +290,17 @@ class OnlineASRProcessor:
             #print("INCOMPLETE:",self.to_flush(self.transcript_buffer.complete()),file=sys.stderr,flush=True)
 
             self.buffer_time_offset += min(int((index_end - index_start) / self.SAMPLING_RATE), 28) # 2 seconds overlap
-            print("buffer time offset:",self.buffer_time_offset,file=sys.stderr,flush=True)
+            print(f"Language: {info.language} ({info.language_probability * 100:.0f}%), duration: {info.duration_after_vad}, buffer time offset: {self.buffer_time_offset}",file=sys.stderr,flush=True)
             # there is a newly confirmed text
             
             #yield self.to_flush(o)
 
-    def chunk_completed_sentence(self):
+    def chunk_completed_sentence(self, tokenizer):
         if self.commited == []: 
             print("Nothing comminted")
             return
         print(self.commited,file=sys.stderr)
-        sents = self.words_to_sentences(self.commited)
+        sents = self.words_to_sentences(self.commited, tokenizer)
         for s in sents:
             print("\t\tSENT:",s,file=sys.stderr)
         if len(sents) < 2:
@@ -357,17 +358,17 @@ class OnlineASRProcessor:
         # print("Removed ",cut_seconds," seconds from audio buffer",file=sys.stderr)
         # print("Chnked, buffer time offset: ",self.buffer_time_offset,file=sys.stderr)
 
-    def words_to_sentences(self, words):
+    def words_to_sentences(self, words, tokenizer):
         """Uses self.tokenizer for sentence segmentation of words.
         Returns: [(beg,end,"sentence 1"),...]
         """
         
         cwords = [w for w in words]
         t = " ".join(o[2] for o in cwords)
-        if hasattr(self.tokenizer, "split"):
-            s = self.tokenizer.split(t)
-        elif hasattr(self.tokenizer, "tokenize"):
-            s = self.tokenizer.tokenize(t)
+        if hasattr(tokenizer, "split"):
+            s = tokenizer.split(t)
+        elif hasattr(tokenizer, "tokenize"):
+            s = tokenizer.tokenize(t)
         else:
             raise ValueError("tokenizer must have split or tokenize method")
         
